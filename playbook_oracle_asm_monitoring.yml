@@ -1,0 +1,234 @@
+---
+- name: Oracle ASM Monitoring & Alerting System
+  hosts: all
+  gather_facts: no
+  vars:
+    central_log_server: "central.server.com"   # Set your central log server
+    central_log_dir: "/tmp/asm_details"
+    sql_server: "mssql.server.com"
+    sql_db: "ASM_MONITOR"
+    sql_user: "sqluser"
+    sql_pass: "sqlpass"
+    smtp_server: "smtp.abc.com"
+    smtp_port: 25
+    email_from: "sender@abc.com"
+    email_to: "abc@abc.com"
+    asm_log_local: "/tmp/asm_details/{{ inventory_hostname }}_asm.log"
+    asm_log_final: "/tmp/asm_details/hostname_final_asm_logs.log"
+    html_report: "/tmp/asm_details/asm_details.html"
+    checkpoint_file: "/tmp/asm_details/checkpoints.log"
+    failed_hosts: []
+
+  pre_tasks:
+    - name: Ensure /tmp/asm_details exists
+      file:
+        path: /tmp/asm_details
+        state: directory
+        mode: '0755'
+
+    - name: Pre-flight | Check SSH connectivity
+      ping:
+      register: ssh_ping
+      ignore_errors: yes
+
+    - name: Pre-flight | Check Python and cx_Oracle
+      shell: |
+        python -c "import cx_Oracle"
+      register: python_oracle
+      ignore_errors: yes
+
+    - name: Pre-flight | Check SQL Server connectivity
+      shell: |
+        python -c "import pyodbc; pyodbc.connect('DRIVER={ODBC Driver 17 for SQL Server};SERVER={{ sql_server }};DATABASE={{ sql_db }};UID={{ sql_user }};PWD={{ sql_pass }}')"
+      register: sql_connect
+      ignore_errors: yes
+
+    - name: Pre-flight | Check central log server access
+      shell: |
+        ssh -o BatchMode=yes {{ central_log_server }} 'echo ok'
+      register: log_server_access
+      ignore_errors: yes
+
+    - name: Pre-flight | Check SMTP server
+      wait_for:
+        host: "{{ smtp_server }}"
+        port: "{{ smtp_port }}"
+        timeout: 5
+      register: smtp_check
+      ignore_errors: yes
+
+    - name: Pre-flight | Log pre-flight results
+      copy:
+        dest: "{{ checkpoint_file }}"
+        content: |
+          Host: {{ inventory_hostname }}
+          SSH: {{ 'PASS' if ssh_ping.ping is defined else 'FAIL' }}
+          Python/cx_Oracle: {{ 'PASS' if python_oracle.rc == 0 else 'FAIL' }}
+          SQL Server: {{ 'PASS' if sql_connect.rc == 0 else 'FAIL' }}
+          Log Server: {{ 'PASS' if log_server_access.rc == 0 else 'FAIL' }}
+          SMTP: {{ 'PASS' if smtp_check.state == 'started' else 'FAIL' }}
+          ---
+
+    - name: Pre-flight | Add to failed_hosts if any check failed
+      set_fact:
+        failed_hosts: "{{ failed_hosts + [inventory_hostname] }}"
+      when: ssh_ping.ping is not defined or python_oracle.rc != 0 or sql_connect.rc != 0 or log_server_access.rc != 0 or smtp_check.state != 'started'
+
+    - name: Pre-flight | Send summary email (placeholder)
+      debug:
+        msg: "[ASM Monitor] Pre-flight Checks – {{ '✅ Passed' if failed_hosts|length == 0 else '❌ Failed' }}"
+
+  tasks:
+    - name: ASM Query | Find ASM process owner
+      shell: |
+        ps -ef | grep asm_pmon | grep -v grep | awk '{print $1}' | head -1
+      register: asm_owner_result
+      changed_when: false
+      when: inventory_hostname not in failed_hosts
+      ignore_errors: yes
+
+    - name: ASM Query | Set Oracle environment variables for ASM owner
+      shell: |
+        ORACLE_SID=$(ps -ef | grep asm_pmon | grep -v grep | awk -F_ '{print $3}')
+        ORAENV_ASK=NO
+        export ORACLE_SID
+        . /usr/local/bin/oraenv
+        env
+      args:
+        executable: /bin/bash
+      register: asm_env
+      become: yes
+      become_user: "{{ asm_owner_result.stdout }}"
+      when: inventory_hostname not in failed_hosts and asm_owner_result.stdout != ''
+      ignore_errors: yes
+
+    - name: ASM Query | Run ASM Diskgroup Query as ASM owner with environment
+      shell: |
+        ORACLE_SID=$(ps -ef | grep asm_pmon | grep -v grep | awk -F_ '{print $3}')
+        ORAENV_ASK=NO
+        export ORACLE_SID
+        . /usr/local/bin/oraenv
+        sqlplus -S / as sysasm <<EOF
+        set pagesize 0 feedback off verify off heading off echo off
+        SELECT
+          '{{ inventory_hostname }}' || ',' ||
+          name || ',' ||
+          type || ',' ||
+          total_mb || ',' ||
+          free_mb || ',' ||
+          usable_file_mb || ',' ||
+          ROUND((1 - (free_mb/total_mb))*100,2) || ',' ||
+          CASE WHEN (1 - (free_mb/total_mb))*100 > 80 THEN 'Add space' ELSE 'OK' END
+        FROM v$asm_diskgroup;
+        exit
+        EOF
+      args:
+        executable: /bin/bash
+      register: asm_query_output
+      become: yes
+      become_user: "{{ asm_owner_result.stdout }}"
+      when: inventory_hostname not in failed_hosts and asm_owner_result.stdout != ''
+      ignore_errors: yes
+
+    - name: ASM Query | Write output to log
+      copy:
+        content: "{{ asm_query_output.stdout }}"
+        dest: "{{ asm_log_local }}"
+      when: inventory_hostname not in failed_hosts and asm_query_output is defined
+      ignore_errors: yes
+
+    - name: ASM Query | Add to failed_hosts if query failed
+      set_fact:
+        failed_hosts: "{{ failed_hosts + [inventory_hostname] }}"
+      when: asm_query_output is not defined or asm_query_output.rc != 0
+
+    - name: Transfer Logs | Copy log to central server
+      shell: |
+        scp {{ asm_log_local }} {{ central_log_server }}:{{ central_log_dir }}/
+      when: inventory_hostname not in failed_hosts
+      ignore_errors: yes
+
+    - name: Transfer Logs | Add to failed_hosts if transfer failed
+      set_fact:
+        failed_hosts: "{{ failed_hosts + [inventory_hostname] }}"
+      when: inventory_hostname not in failed_hosts and (asm_query_output is not defined or asm_query_output.rc != 0)
+
+  # The following block should be run only on the central log server
+- name: Oracle ASM Monitoring | Central Log Server Tasks
+  hosts: central_log_server
+  gather_facts: no
+  vars:
+    central_log_dir: "/tmp/asm_details"
+    asm_log_final: "/tmp/asm_details/hostname_final_asm_logs.log"
+    sql_server: "mssql.server.com"
+    sql_db: "ASM_MONITOR"
+    sql_user: "sqluser"
+    sql_pass: "sqlpass"
+    html_report: "/tmp/asm_details/asm_details.html"
+    email_from: "sender@abc.com"
+    email_to: "abc@abc.com"
+    smtp_server: "smtp.abc.com"
+    smtp_port: 25
+    checkpoint_file: "/tmp/asm_details/checkpoints.log"
+
+  tasks:
+    - name: Concatenate all logs into final log
+      shell: |
+        cat {{ central_log_dir }}/*_asm.log > {{ asm_log_final }}
+      args:
+        executable: /bin/bash
+
+    - name: Insert data from log into SQL Server (call script)
+      shell: |
+        python3 /tmp/asm_details/insert_sql.py {{ asm_log_final }}
+      register: sql_insert
+      ignore_errors: yes
+
+    - name: Log SQL insert status
+      copy:
+        dest: "{{ checkpoint_file }}"
+        content: |
+          SQL Insert: {{ 'PASS' if sql_insert.rc == 0 else 'FAIL' }}
+          ---
+        mode: 'a'
+
+    - name: Generate HTML report from SQL Server (call script)
+      shell: |
+        python3 /tmp/asm_details/generate_html.py
+      register: html_gen
+      ignore_errors: yes
+
+    - name: Log HTML report status
+      copy:
+        dest: "{{ checkpoint_file }}"
+        content: |
+          HTML Report: {{ 'PASS' if html_gen.rc == 0 else 'FAIL' }}
+          ---
+        mode: 'a'
+
+    - name: Send HTML report via email (call script)
+      shell: |
+        python3 /tmp/asm_details/send_mail.py
+      register: mail_send
+      ignore_errors: yes
+
+    - name: Log email status
+      copy:
+        dest: "{{ checkpoint_file }}"
+        content: |
+          Email: {{ 'PASS' if mail_send.rc == 0 else 'FAIL' }}
+          ---
+        mode: 'a'
+
+    - name: Insert failed hosts into SQL Server (call script)
+      shell: |
+        python3 /tmp/asm_details/insert_failed_hosts.py {{ checkpoint_file }}
+      when: hostvars['all'][0]['failed_hosts']|length > 0
+      ignore_errors: yes
+
+    - name: Track job progress every 5 seconds (placeholder)
+      debug:
+        msg: "Job progress heartbeat (implement as async/background task in production)"
+
+# Note: Supporting scripts (insert_sql.py, generate_html.py, send_mail.py, insert_failed_hosts.py) should be placed in /tmp/asm_details on the central log server.
+#       Variables and credentials should be managed securely (e.g., Ansible Vault). 
