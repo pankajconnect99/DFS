@@ -1224,5 +1224,465 @@ Exclusion: The SQL query excludes the default CDB$ROOT container as requested.
 Dependencies: Ensure the community.general collection is installed for Ansible MSSQL modules (ansible-galaxy collection install community.general).
 
 
+##################################
+
+AI-Enhanced Oracle Redo Log Size Analysis with Regression and Reporting (MSSQL)
+This solution collects redo log data, uses a regression model to predict optimal redo log sizes based on historical patterns, combines it with heuristic logic, executes via Ansible Tower across 100+ servers, stores results in MSSQL, and generates a styled HTML report.
+1. SQL Query for Redo Log Data Collection
+This SQL script collects redo log details, redo generation rates, and log switch frequency over the last 7 days to provide data for regression analysis.
+-- redo_log_analysis.sql
+SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
+COL server_name FORMAT A30
+COL cdb_name FORMAT A30
+COL pdb_name FORMAT A30
+COL group# FORMAT 9999
+COL member FORMAT A60
+COL size_mb FORMAT 999999
+COL redo_mb_per_day FORMAT 999999
+COL switches_per_day FORMAT 999999
+
+WITH redo_stats AS (
+    SELECT 
+        SUM(CASE WHEN name = 'redo size' THEN value ELSE 0 END) / 1024 / 1024 AS redo_mb_per_day
+    FROM v$sysstat
+    WHERE name IN ('redo size')
+),
+log_switch_freq AS (
+    SELECT 
+        COUNT(*) / NULLIF((MAX(first_time) - MIN(first_time)), 0) AS switches_per_day
+    FROM v$log_history
+    WHERE first_time > SYSDATE - 7
+),
+redo_info AS (
+    SELECT 
+        SYS_CONTEXT('USERENV', 'SERVER_HOST') AS server_name,
+        SYS_CONTEXT('USERENV', 'DB_NAME') AS cdb_name,
+        NVL(SYS_CONTEXT('USERENV', 'CON_NAME'), 'CDB$ROOT') AS pdb_name,
+        a.group#,
+        b.member,
+        a.bytes/1024/1024 AS size_mb,
+        redo_mb_per_day,
+        switches_per_day
+    FROM v$log a
+    JOIN v$logfile b ON a.group# = b.group#
+    CROSS JOIN redo_stats
+    CROSS JOIN log_switch_freq
+    WHERE SYS_CONTEXT('USERENV', 'CON_NAME') NOT IN ('CDB$ROOT')
+)
+SELECT 
+    server_name,
+    cdb_name,
+    pdb_name,
+    group#,
+    member,
+    size_mb,
+    redo_mb_per_day,
+    switches_per_day
+FROM redo_info
+ORDER BY server_name, cdb_name, pdb_name, group#;
+
+2. Ansible Playbook for Execution and MSSQL Storage
+This playbook connects to Oracle servers, runs the SQL query, and stores results in an MSSQL table for regression and heuristic processing.
+# redo_log_analysis_playbook.yml
+---
+- name: Oracle Redo Log Size Analysis and MSSQL Storage
+  hosts: oracle_servers
+  vars:
+    oracle_user: system
+    oracle_password: "{{ vault_oracle_password }}"  # Store in Ansible Vault
+    mssql_host: mssql_server.example.com
+    mssql_user: ansible_user
+    mssql_password: "{{ vault_mssql_password }}"  # Store in Ansible Vault
+    mssql_db: OracleMetrics
+    sql_script: /tmp/redo_log_analysis.sql
+  tasks:
+    - name: Copy SQL script to Oracle servers
+      copy:
+        src: redo_log_analysis.sql
+        dest: "{{ sql_script }}"
+        mode: '0644'
+
+    - name: Execute SQL query for redo log analysis
+      shell: |
+        sqlplus -s {{ oracle_user }}/{{ oracle_password }} @{{ sql_script }} > /tmp/redo_log_output.csv
+      register: sql_output
+
+    - name: Fetch CSV output from Oracle servers
+      fetch:
+        src: "/tmp/redo_log_output.csv"
+        dest: "/tmp/{{ inventory_hostname }}_redo_log_output.csv"
+        flat: yes
+
+    - name: Install MSSQL tools and Python driver
+      package:
+        name: 
+          - mssql-tools
+          - python3-pymssql
+        state: present
+      delegate_to: localhost
+
+    - name: Create MSSQL database
+      community.general.mssql_db:
+        name: "{{ mssql_db }}"
+        state: present
+        login_host: "{{ mssql_host }}"
+        login_user: "{{ mssql_user }}"
+        login_password: "{{ mssql_password }}"
+      delegate_to: localhost
+
+    - name: Create redo log analysis table in MSSQL
+      community.general.mssql_script:
+        db: "{{ mssql_db }}"
+        login_host: "{{ mssql_host }}"
+        login_user: "{{ mssql_user }}"
+        login_password: "{{ mssql_password }}"
+        script: |
+          IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'redo_log_analysis')
+          CREATE TABLE redo_log_analysis (
+            id INT IDENTITY(1,1) PRIMARY KEY,
+            server_name VARCHAR(30),
+            cdb_name VARCHAR(30),
+            pdb_name VARCHAR(30),
+            group_num INT,
+            member VARCHAR(60),
+            size_mb DECIMAL(10,2),
+            redo_mb_per_day DECIMAL(10,2),
+            switches_per_day DECIMAL(10,2),
+            optimal_size_mb DECIMAL(10,2),
+            status VARCHAR(20),
+            analysis_date DATETIME DEFAULT GETDATE()
+          )
+      delegate_to: localhost
+
+    - name: Load CSV data into MSSQL
+      community.general.mssql_script:
+        db: "{{ mssql_db }}"
+        login_host: "{{ mssql_host }}"
+        login_user: "{{ mssql_user }}"
+        login_password: "{{ mssql_password }}"
+        script: |
+          BULK INSERT redo_log_analysis
+          FROM '/tmp/{{ inventory_hostname }}_redo_log_output.csv'
+          WITH (
+            FIELDTERMINATOR = ',',
+            ROWTERMINATOR = '\n',
+            FIRSTROW = 1,
+            FIELDQUOTE = ''
+          )
+      delegate_to: localhost
+
+    - name: Clean up temporary files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ sql_script }}"
+        - "/tmp/{{ inventory_hostname }}_redo_log_output.csv"
+      ignore_errors: yes
+
+3. Python Script for Regression and Heuristic Recommendation and Reporting
+This Python script connects to MSSQL, trains a simple linear regression model on historical data, combines it with heuristic logic, updates the table, and generates a styled HTML report.
+# generate_html_report.py
+import pymssql
+from datetime import datetime
+import os
+import numpy as np
+from sklearn.linear_model import LinearRegression
+
+# MSSQL connection details
+config = {
+    'server': 'mssql_server.example.com',
+    'user': 'ansible_user',
+    'password': 'your_mssql_password',  # Replace or use environment variable
+    'database': 'OracleMetrics'
+}
+
+# Heuristic model as fallback
+def heuristic_optimal_size(redo_mb_per_day, switches_per_day):
+    base_size = redo_mb_per_day / (24 * 3)  # Target 3 switches/hour (~20 min)
+    workload_adjustment = 1.5 if switches_per_day > 6 * 24 else 1.2
+    optimal_size = min(max(base_size * workload_adjustment, 100), 4096)
+    return round(optimal_size, 2)
+
+# Connect to MSSQL
+conn = pymssql.connect(**config)
+cursor = conn.cursor()
+
+# Fetch historical data for regression
+cursor.execute("""
+    SELECT redo_mb_per_day, switches_per_day, size_mb
+    FROM redo_log_analysis
+    WHERE analysis_date > DATEADD(day, -30, GETDATE())
+    AND size_mb IS NOT NULL AND redo_mb_per_day IS NOT NULL AND switches_per_day IS NOT NULL
+""")
+data = cursor.fetchall()
+
+# Prepare regression model
+X = []  # Features: redo_mb_per_day, switches_per_day
+y = []  # Target: size_mb (assumed to be "optimal" from past configurations)
+for row in data:
+    redo_mb_per_day, switches_per_day, size_mb = row
+    X.append([redo_mb_per_day, switches_per_day])
+    y.append(size_mb)
+
+# Train linear regression model if enough data
+regression_model = None
+if len(X) > 10:  # Minimum data points for meaningful regression
+    X = np.array(X)
+    y = np.array(y)
+    regression_model = LinearRegression()
+    regression_model.fit(X, y)
+
+# Fetch current data and calculate optimal size
+cursor.execute("""
+    SELECT id, server_name, cdb_name, pdb_name, group_num, member, 
+           size_mb, redo_mb_per_day, switches_per_day
+    FROM redo_log_analysis
+    ORDER BY server_name, cdb_name, pdb_name, group_num
+""")
+rows = cursor.fetchall()
+
+# Update table with AI-based optimal size and status
+for row in rows:
+    id, server_name, cdb_name, pdb_name, group_num, member, size_mb, redo_mb_per_day, switches_per_day = row
+    
+    # Calculate optimal size
+    if regression_model and redo_mb_per_day is not None and switches_per_day is not None:
+        # Use regression prediction
+        reg_prediction = regression_model.predict([[redo_mb_per_day, switches_per_day]])[0]
+        # Combine with heuristic for robustness
+        heuristic_size = heuristic_optimal_size(redo_mb_per_day, switches_per_day)
+        optimal_size_mb = round((0.6 * reg_prediction + 0.4 * heuristic_size), 2)
+    else:
+        # Fallback to heuristic if insufficient data or model fails
+        optimal_size_mb = heuristic_optimal_size(redo_mb_per_day, switches_per_day)
+    
+    # Ensure constraints: 100 MB min, 4096 MB max
+    optimal_size_mb = min(max(optimal_size_mb, 100), 4096)
+    status = 'NEEDS REVIEW' if size_mb < optimal_size_mb * 0.9 else 'NO REVIEW REQUIRED'
+    
+    cursor.execute("""
+        UPDATE redo_log_analysis
+        SET optimal_size_mb = %s, status = %s
+        WHERE id = %s
+    """, (optimal_size_mb, status, id))
+conn.commit()
+
+# Fetch updated data for report
+cursor.execute("""
+    SELECT server_name, cdb_name, pdb_name, group_num, member, 
+           size_mb, optimal_size_mb, status, analysis_date
+    FROM redo_log_analysis
+    ORDER BY server_name, cdb_name, pdb_name, group_num
+""")
+rows = cursor.fetchall()
+
+# HTML template
+html = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Oracle Redo Log Size Report</title>
+    <style>
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-family: Arial, sans-serif;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+        th {
+            background-color: #4CAF50;
+            color: white;
+        }
+        tr:nth-child(even) {background-color: #f2f2f2;}
+        tr:hover {background-color: #ddd;}
+        .needs-review {background-color: #ffcccc;}
+    </style>
+</head>
+<body>
+    <h1>Oracle Redo Log Size Analysis Report</h1>
+    <p>Generated on: {date}</p>
+    <table>
+        <tr>
+            <th>Server Name</th>
+            <th>CDB Name</th>
+            <th>PDB Name</th>
+            <th>Group #</th>
+            <th>Redo Log Member</th>
+            <th>Size (MB)</th>
+            <th>Optimal Size (MB)</th>
+            <th>Recommendation</th>
+            <th>Analysis Date</th>
+        </tr>
+"""
+
+# Add table rows
+for row in rows:
+    server_name, cdb_name, pdb_name, group_num, member, size_mb, optimal_size_mb, status, analysis_date = row
+    row_class = 'class="needs-review"' if status == 'NEEDS REVIEW' else ''
+    html += f"""
+        <tr {row_class}>
+            <td>{server_name}</td>
+            <td>{cdb_name}</td>
+            <td>{pdb_name}</td>
+            <td>{group_num}</td>
+            <td>{member}</td>
+            <td>{size_mb:.2f}</td>
+            <td>{optimal_size_mb:.2f}</td>
+            <td>{status}</td>
+            <td>{analysis_date}</td>
+        </tr>
+    """
+
+# Close HTML
+html += """
+    </table>
+</body>
+</html>
+"""
+
+# Write to file
+report_file = f"redo_log_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+with open(report_file, 'w') as f:
+    f.write(html.format(date=datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+
+# Close connection
+cursor.close()
+conn.close()
+
+print(f"Report generated: {report_file}")
+
+4. Ansible Playbook to Generate Report
+This playbook runs the Python script to apply regression and heuristic recommendations and generate the HTML report.
+# generate_report_playbook.yml
+---
+- name: Generate Oracle Redo Log Size HTML Report
+  hosts: localhost
+  vars:
+    python_script: generate_html_report.py
+  tasks:
+    - name: Copy Python script to local machine
+      copy:
+        src: "{{ python_script }}"
+        dest: "/tmp/{{ python_script }}"
+        mode: '0755'
+
+    - name: Install Python dependencies
+      pip:
+        name: 
+          - pymssql
+          - numpy
+          - scikit-learn
+        state: present
+
+    - name: Run Python script to generate HTML report
+      command: python3 /tmp/{{ python_script }}
+      register: report_output
+
+    - name: Display report location
+      debug:
+        msg: "{{ report_output.stdout }}"
+
+    - name: Clean up temporary Python script
+      file:
+        path: "/tmp/{{ python_script }}"
+        state: absent
+      ignore_errors: yes
+
+AI-Enhanced Recommendation Logic
+
+Data Collection:
+Gathers redo log size, redo generation rate (V$SYSSTAT), and log switch frequency (V$LOG_HISTORY) over 7 days.
+
+
+Regression Model:
+Uses a linear regression model from scikit-learn to predict optimal size.
+Trains on historical data (last 30 days) with features: redo_mb_per_day and switches_per_day.
+Target: Current size_mb, assuming past configurations were reasonable starting points.
+Requires at least 10 data points for training; otherwise, falls back to heuristic.
+
+
+Heuristic Fallback:
+Base size: Targets 3 switches/hour (~20 minutes) based on redo generation.
+Workload adjustment: 1.5x multiplier if switches exceed 6/hour, 1.2x otherwise.
+Constraints: 100 MB min, 4096 MB (4 GB) max.
+
+
+Combined Approach:
+If regression is available, optimal size is a weighted average: 60% regression prediction + 40% heuristic.
+Ensures robustness by blending data-driven insights with practical rules.
+
+
+Recommendation:
+Flags 'NEEDS REVIEW' if current size is less than 90% of the optimal size.
+
+
+Rationale:
+Regression learns from historical patterns, adapting to your environment.
+Heuristic ensures sanity checks and handles cases with insufficient data.
+
+
+
+Prerequisites and Setup
+
+Oracle Environment:
+Ensure sqlplus is installed on all Oracle servers.
+The oracle_user (e.g., SYSTEM) needs privileges to query V$LOG, V$LOGFILE, V$SYSSTAT, and V$LOG_HISTORY.
+
+
+Ansible Tower:
+Define an inventory group oracle_servers with all 100+ Oracle server hosts.
+Store oracle_password and mssql_password in Ansible Vault for security.
+Schedule the first playbook (redo_log_analysis_playbook.yml) to run periodically.
+
+
+MSSQL Server:
+Set up an MSSQL server (mssql_server.example.com) with the OracleMetrics database.
+Grant the ansible_user privileges for table creation and data loading.
+
+
+Python Environment:
+Ensure Python 3 and packages (pymssql, numpy, scikit-learn) are installed on the machine running the report playbook.
+Install mssql-tools for Ansible's MSSQL modules.
+
+
+File Locations:
+Place redo_log_analysis.sql, redo_log_analysis_playbook.yml, generate_html_report.py, and generate_report_playbook.yml in your Ansible project directory.
+
+
+
+Execution Steps
+
+Run Analysis Playbook:
+In Ansible Tower, create a job template for redo_log_analysis_playbook.yml.
+Schedule it to run across all Oracle servers (e.g., daily or weekly) to collect data.
+
+
+Run Report Playbook:
+Create a job template for generate_report_playbook.yml.
+Run it after the analysis playbook to train the regression model, apply recommendations, and generate the HTML report.
+
+
+View Report:
+The HTML report (e.g., redo_log_report_20250610_003552.html) will be generated with a styled table, highlighting rows needing review in red.
+
+
+
+Notes
+
+Security: Replace hardcoded passwords in the Python script with environment variables or a secure vault.
+Customization: Adjust regression weights, heuristic parameters (e.g., switches per hour, multipliers), or HTML styling as needed.
+Performance: For 100+ servers, consider batching the playbook execution to avoid overloading the MSSQL server.
+Data Quality: Regression improves with more historical data; run the analysis playbook regularly to build a robust dataset.
+Exclusion: The SQL query excludes the default CDB$ROOT container as requested.
+Dependencies: Ensure the community.general collection is installed for Ansible MSSQL modules (ansible-galaxy collection install community.general).
+
+
+
+
 
 
