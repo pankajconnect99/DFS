@@ -1,3 +1,73 @@
+
+-- redo_log_analysis.sql
+SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
+COL server_name FORMAT A30
+COL cdb_name FORMAT A30
+COL pdb_name FORMAT A30
+COL group# FORMAT 9999
+COL member FORMAT A60
+COL size_mb FORMAT 999999
+COL optimal_size_mb FORMAT 999999
+COL status FORMAT A15
+
+WITH redo_stats AS (
+    SELECT 
+        SUM(CASE WHEN name = 'redo size' THEN value ELSE 0 END) / 1024 / 1024 AS redo_mb_per_day
+    FROM v$sysstat
+    WHERE name IN ('redo size')
+),
+log_switch_freq AS (
+    SELECT 
+        COUNT(*) / NULLIF((MAX(first_time) - MIN(first_time)), 0) AS switches_per_day
+    FROM v$log_history
+    WHERE first_time > SYSDATE - 1
+),
+optimal_calc AS (
+    SELECT 
+        redo_mb_per_day,
+        switches_per_day,
+        -- Custom optimal size logic:
+        -- 1. Target 2-4 switches/hour (15-30 min each) based on redo generation
+        -- 2. Apply a multiplier (1.5x) for peak workload buffer
+        -- 3. Ensure minimum 100 MB, cap at 4096 MB (4 GB) for practicality
+        LEAST(
+            GREATEST(
+                redo_mb_per_day / (24 * 3) * 1.5,  -- Redo rate for 3 switches/hour, 1.5x buffer
+                100  -- Minimum size of 100 MB
+            ),
+            4096  -- Maximum size of 4 GB
+        ) AS optimal_size_mb
+    FROM redo_stats, log_switch_freq
+),
+redo_info AS (
+    SELECT 
+        SYS_CONTEXT('USERENV', 'SERVER_HOST') AS server_name,
+        SYS_CONTEXT('USERENV', 'DB_NAME') AS cdb_name,
+        NVL(SYS_CONTEXT('USERENV', 'CON_NAME'), 'CDB$ROOT') AS pdb_name,
+        a.group#,
+        b.member,
+        a.bytes/1024/1024 AS size_mb,
+        optimal_size_mb
+    FROM v$log a
+    JOIN v$logfile b ON a.group# = b.group#
+    CROSS JOIN optimal_calc
+    WHERE SYS_CONTEXT('USERENV', 'CON_NAME') NOT IN ('CDB$ROOT')
+)
+SELECT 
+    server_name,
+    cdb_name,
+    pdb_name,
+    group#,
+    member,
+    size_mb,
+    optimal_size_mb,
+    CASE 
+        WHEN size_mb < optimal_size_mb * 0.9 THEN 'NEEDS REVIEW'
+        ELSE 'NO REVIEW REQUIRED'
+    END AS status
+FROM redo_info
+ORDER BY server_name, cdb_name, pdb_name, group#;
+
 Oracle Redo Log Size Analysis and Reporting Solution (MSSQL)
 This solution provides scripts to:
 
