@@ -353,3 +353,403 @@ Performance: For 100+ servers, consider batching the playbook execution to avoid
 Exclusion: The SQL query excludes the default CDB$ROOT container as requested.
 Dependencies: Ensure the community.general collection is installed for Ansible MSSQL modules (ansible-galaxy collection install community.general).
 
+
+
+Enhanced Oracle Redo Log Size Analysis and Reporting Solution (MSSQL)
+This solution improves the redo log size analysis by incorporating additional checks beyond V$INSTANCE_RECOVERY for more accurate optimal size recommendations, executes via Ansible Tower across 100+ servers, stores results in MSSQL, and generates a styled HTML report.
+1. Enhanced SQL Query for Redo Log Analysis
+This SQL script queries redo log sizes and calculates an optimal size using multiple factors: V$INSTANCE_RECOVERY, redo generation rate from V$SYSSTAT, and log switch frequency from V$LOG_HISTORY. It flags databases needing review if the current size is too small.
+-- redo_log_analysis.sql
+SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
+COL server_name FORMAT A30
+COL cdb_name FORMAT A30
+COL pdb_name FORMAT A30
+COL group# FORMAT 9999
+COL member FORMAT A60
+COL size_mb FORMAT 999999
+COL optimal_size_mb FORMAT 999999
+COL status FORMAT A15
+
+WITH redo_stats AS (
+    SELECT 
+        SUM(CASE WHEN name = 'redo size' THEN value ELSE 0 END) / 1024 / 1024 AS redo_mb_per_day
+    FROM v$sysstat
+    WHERE name IN ('redo size')
+),
+log_switch_freq AS (
+    SELECT 
+        COUNT(*) / (MAX(first_time) - MIN(first_time)) AS switches_per_day
+    FROM v$log_history
+    WHERE first_time > SYSDATE - 1
+),
+optimal_calc AS (
+    SELECT 
+        -- Base optimal size from v$instance_recovery (in MB)
+        optimal_logfile_size AS base_optimal_mb,
+        -- Estimate redo generation rate and desired switch frequency (e.g., every 15-30 min)
+        redo_mb_per_day,
+        switches_per_day,
+        -- Calculate optimal size: account for redo generation and aim for 2-4 switches/hour
+        GREATEST(
+            optimal_logfile_size,  -- From v$instance_recovery
+            redo_mb_per_day / (24 * 4),  -- Redo rate for 4 switches/hour (15 min each)
+            50  -- Minimum size of 50 MB
+        ) AS optimal_size_mb
+    FROM v$instance_recovery, redo_stats, log_switch_freq
+),
+redo_info AS (
+    SELECT 
+        SYS_CONTEXT('USERENV', 'SERVER_HOST') AS server_name,
+        SYS_CONTEXT('USERENV', 'DB_NAME') AS cdb_name,
+        NVL(SYS_CONTEXT('USERENV', 'CON_NAME'), 'CDB$ROOT') AS pdb_name,
+        a.group#,
+        b.member,
+        a.bytes/1024/1024 AS size_mb,
+        optimal_size_mb
+    FROM v$log a
+    JOIN v$logfile b ON a.group# = b.group#
+    CROSS JOIN optimal_calc
+    WHERE SYS_CONTEXT('USERENV', 'CON_NAME') NOT IN ('CDB$ROOT')
+)
+SELECT 
+    server_name,
+    cdb_name,
+    pdb_name,
+    group#,
+    member,
+    size_mb,
+    optimal_size_mb,
+    CASE 
+        WHEN size_mb < optimal_size_mb THEN 'NEEDS REVIEW'
+        ELSE 'NO REVIEW REQUIRED'
+    END AS status
+FROM redo_info
+ORDER BY server_name, cdb_name, pdb_name, group#;
+
+2. Ansible Playbook for Execution and MSSQL Storage
+This playbook connects to Oracle servers, runs the enhanced SQL query, and stores results in an MSSQL table.
+# redo_log_analysis_playbook.yml
+---
+- name: Oracle Redo Log Size Analysis and MSSQL Storage
+  hosts: oracle_servers
+  vars:
+    oracle_user: system
+    oracle_password: "{{ vault_oracle_password }}"  # Store in Ansible Vault
+    mssql_host: mssql_server.example.com
+    mssql_user: ansible_user
+    mssql_password: "{{ vault_mssql_password }}"  # Store in Ansible Vault
+    mssql_db: OracleMetrics
+    sql_script: /tmp/redo_log_analysis.sql
+  tasks:
+    - name: Copy SQL script to Oracle servers
+      copy:
+        src: redo_log_analysis.sql
+        dest: "{{ sql_script }}"
+        mode: '0644'
+
+    - name: Execute SQL query for redo log analysis
+      shell: |
+        sqlplus -s {{ oracle_user }}/{{ oracle_password }} @{{ sql_script }} > /tmp/redo_log_output.csv
+      register: sql_output
+
+    - name: Fetch CSV output from Oracle servers
+      fetch:
+        src: /tmp/redo_log_output.csv
+        dest: /tmp/{{ inventory_hostname }}_redo_log_output.csv
+        flat: yes
+
+    - name: Install MSSQL tools and Python driver
+      package:
+        name: 
+          - mssql-tools
+          - python3-pymssql
+        state: present
+      delegate_to: localhost
+
+    - name: Create MSSQL database
+      community.general.mssql_db:
+        name: "{{ mssql_db }}"
+        state: present
+        login_host: "{{ mssql_host }}"
+        login_user: "{{ mssql_user }}"
+        login_password: "{{ mssql_password }}"
+      delegate_to: localhost
+
+    - name: Create redo log analysis table in MSSQL
+      community.general.mssql_script:
+        db: "{{ mssql_db }}"
+        login_host: "{{ mssql_host }}"
+        login_user: "{{ mssql_user }}"
+        login_password: "{{ mssql_password }}"
+        script: |
+          IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'redo_log_analysis')
+          CREATE TABLE redo_log_analysis (
+            id INT IDENTITY(1,1) PRIMARY KEY,
+            server_name VARCHAR(30),
+            cdb_name VARCHAR(30),
+            pdb_name VARCHAR(30),
+            group_num INT,
+            member VARCHAR(60),
+            size_mb DECIMAL(10,2),
+            optimal_size_mb DECIMAL(10,2),
+            status VARCHAR(20),
+            analysis_date DATETIME DEFAULT GETDATE()
+          )
+      delegate_to: localhost
+
+    - name: Load CSV data into MSSQL
+      community.general.mssql_script:
+        db: "{{ mssql_db }}"
+        login_host: "{{ mssql_host }}"
+        login_user: "{{ mssql_user }}"
+        login_password: "{{ mssql_password }}"
+        script: |
+          BULK INSERT redo_log_analysis
+          FROM '/tmp/{{ inventory_hostname }}_redo_log_output.csv'
+          WITH (
+            FIELDTERMINATOR = ',',
+            ROWTERMINATOR = '\n',
+            FIRSTROW = 1
+          )
+      delegate_to: localhost
+
+    - name: Clean up temporary files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ sql_script }}"
+        - "/tmp/{{ inventory_hostname }}_redo_log_output.csv"
+      ignore_errors: yes
+
+3. MSSQL Query for Report Generation
+This SQL query generates a formatted report from the MSSQL table.
+-- generate_redo_log_report.sql
+SELECT 
+    server_name AS 'Server Name',
+    cdb_name AS 'CDB Name',
+    pdb_name AS 'PDB Name',
+    group_num AS 'Group #',
+    member AS 'Redo Log Member',
+    ROUND(size_mb, 2) AS 'Size (MB)',
+    ROUND(optimal_size_mb, 2) AS 'Optimal Size (MB)',
+    status AS 'Recommendation',
+    analysis_date AS 'Analysis Date'
+FROM redo_log_analysis
+ORDER BY server_name, cdb_name, pdb_name, group_num;
+
+4. Python Script for Fancy HTML Report
+This Python script connects to MSSQL, fetches the data, and generates a styled HTML report.
+# generate_html_report.py
+import pymssql
+from datetime import datetime
+import os
+
+# MSSQL connection details
+config = {
+    'server': 'mssql_server.example.com',
+    'user': 'ansible_user',
+    'password': 'your_mssql_password',  # Replace or use environment variable
+    'database': 'OracleMetrics'
+}
+
+# Connect to MSSQL
+conn = pymssql.connect(**config)
+cursor = conn.cursor()
+
+# Query data
+cursor.execute("""
+    SELECT server_name, cdb_name, pdb_name, group_num, member, 
+           size_mb, optimal_size_mb, status, analysis_date
+    FROM redo_log_analysis
+    ORDER BY server_name, cdb_name, pdb_name, group_num
+""")
+rows = cursor.fetchall()
+
+# HTML template
+html = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Oracle Redo Log Size Report</title>
+    <style>
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-family: Arial, sans-serif;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+        th {
+            background-color: #4CAF50;
+            color: white;
+        }
+        tr:nth-child(even) {background-color: #f2f2f2;}
+        tr:hover {background-color: #ddd;}
+        .needs-review {background-color: #ffcccc;}
+    </style>
+</head>
+<body>
+    <h1>Oracle Redo Log Size Analysis Report</h1>
+    <p>Generated on: {date}</p>
+    <table>
+        <tr>
+            <th>Server Name</th>
+            <th>CDB Name</th>
+            <th>PDB Name</th>
+            <th>Group #</th>
+            <th>Redo Log Member</th>
+            <th>Size (MB)</th>
+            <th>Optimal Size (MB)</th>
+            <th>Recommendation</th>
+            <th>Analysis Date</th>
+        </tr>
+"""
+
+# Add table rows
+for row in rows:
+    server_name, cdb_name, pdb_name, group_num, member, size_mb, optimal_size_mb, status, analysis_date = row
+    row_class = 'class="needs-review"' if status == 'NEEDS REVIEW' else ''
+    html += f"""
+        <tr {row_class}>
+            <td>{server_name}</td>
+            <td>{cdb_name}</td>
+            <td>{pdb_name}</td>
+            <td>{group_num}</td>
+            <td>{member}</td>
+            <td>{size_mb:.2f}</td>
+            <td>{optimal_size_mb:.2f}</td>
+            <td>{status}</td>
+            <td>{analysis_date}</td>
+        </tr>
+    """
+
+# Close HTML
+html += """
+    </table>
+</body>
+</html>
+"""
+
+# Write to file
+report_file = f"redo_log_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+with open(report_file, 'w') as f:
+    f.write(html.format(date=datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+
+# Close connection
+cursor.close()
+conn.close()
+
+print(f"Report generated: {report_file}")
+
+5. Ansible Playbook to Generate Report
+This playbook runs the Python script to generate the HTML report.
+# generate_report_playbook.yml
+---
+- name: Generate Oracle Redo Log Size HTML Report
+  hosts: localhost
+  vars:
+    python_script: generate_html_report.py
+  tasks:
+    - name: Copy Python script to local machine
+      copy:
+        src: "{{ python_script }}"
+        dest: "/tmp/{{ python_script }}"
+        mode: '0755'
+
+    - name: Install Python MSSQL driver
+      pip:
+        name: pymssql
+        state: present
+
+    - name: Run Python script to generate HTML report
+      command: python3 /tmp/{{ python_script }}
+      register: report_output
+
+    - name: Display report location
+      debug:
+        msg: "{{ report_output.stdout }}"
+
+    - name: Clean up temporary Python script
+      file:
+        path: "/tmp/{{ python_script }}"
+        state: absent
+      ignore_errors: yes
+
+Enhanced Optimal Size Logic
+
+Multiple Checks:
+Uses V$INSTANCE_RECOVERY.optimal_logfile_size as a baseline.
+Incorporates V$SYSSTAT to calculate daily redo generation rate (redo size in MB).
+Analyzes V$LOG_HISTORY for log switch frequency over the last 24 hours.
+Optimal size is the greatest of:
+optimal_logfile_size from V$INSTANCE_RECOVERY
+Redo generation rate divided by 96 (4 switches/hour, every 15 minutes)
+A minimum of 50 MB to avoid undersizing
+
+
+
+
+Rationale:
+Redo log size should handle peak redo generation and ensure log switches occur every 15-30 minutes for optimal performance and recovery.
+This prevents V$INSTANCE_RECOVERY alone from underestimating needs in high-transaction environments.
+
+
+
+Prerequisites and Setup
+
+Oracle Environment:
+Ensure sqlplus is installed on all Oracle servers.
+The oracle_user (e.g., SYSTEM) needs privileges to query V$LOG, V$LOGFILE, V$INSTANCE_RECOVERY, V$SYSSTAT, and V$LOG_HISTORY.
+
+
+Ansible Tower:
+Define an inventory group oracle_servers with all 100+ Oracle server hosts.
+Store oracle_password and mssql_password in Ansible Vault for security.
+Schedule the first playbook (redo_log_analysis_playbook.yml) to run periodically.
+
+
+MSSQL Server:
+Set up an MSSQL server (mssql_server.example.com) with the OracleMetrics database.
+Grant the ansible_user privileges for table creation and data loading.
+
+
+Python Environment:
+Ensure Python 3 and pymssql are installed on the machine running the report playbook.
+Install mssql-tools for Ansible's MSSQL modules.
+
+
+File Locations:
+Place redo_log_analysis.sql, redo_log_analysis_playbook.yml, generate_html_report.py, and generate_report_playbook.yml in your Ansible project directory.
+
+
+
+Execution Steps
+
+Run Analysis Playbook:
+In Ansible Tower, create a job template for redo_log_analysis_playbook.yml.
+Schedule it to run across all Oracle servers (e.g., daily or weekly).
+
+
+Run Report Playbook:
+Create a job template for generate_report_playbook.yml.
+Run it after the analysis playbook to generate the HTML report.
+
+
+View Report:
+The HTML report (e.g., redo_log_report_20250610_001652.html) will be generated with a styled table, highlighting rows needing review in red.
+
+
+
+Notes
+
+Security: Replace hardcoded passwords in the Python script with environment variables or a secure vault.
+Customization: Adjust the optimal size logic (e.g., switches per hour) or HTML styling as needed.
+Performance: For 100+ servers, consider batching the playbook execution to avoid overloading the MSSQL server.
+Exclusion: The SQL query excludes the default CDB$ROOT container as requested.
+Dependencies: Ensure the community.general collection is installed for Ansible MSSQL modules (ansible-galaxy collection install community.general).
+
+
